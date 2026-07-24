@@ -1,0 +1,16 @@
+{
+  "name": "@theslotbot/shared",
+  "version": "1.0.0",
+  "description": "Shared types, enums, and constants for theslotbot monorepo",
+  "main": "./src/types/index.ts",
+  "exports": {
+    "./types": "./src/types/index.ts",
+    "./constants": "./src/constants/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

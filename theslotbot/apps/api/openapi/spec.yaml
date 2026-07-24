@@ -1,0 +1,1505 @@
+openapi: 3.1.0
+
+info:
+  title: theslotbot API
+  version: 1.0.0
+  description: |
+    WhatsApp booking automation backend for theslotbot.
+
+    ## Contract rules
+    - This file is the source of truth for the API shape.
+    - Only Dev 1 merges changes to this file (after team discussion).
+    - Dev 3 runs `msw` against this spec from Day 1 and is never blocked.
+    - Any drift between this spec and the real route handlers is a bug,
+      caught at Gate 1 (Day 10) integration checkpoint.
+    - All monetary values are in **paise** (integer). 100 paise = ₹1.
+    - All timestamps are ISO 8601 with timezone offset.
+    - All IDs are UUIDs (string).
+
+servers:
+  - url: http://localhost:3000/api
+    description: Local development
+  - url: https://api-staging.theslotbot.com/api
+    description: Staging
+  - url: https://api.theslotbot.com/api
+    description: Production
+
+# ─────────────────────────────────────────────
+# SECURITY
+# ─────────────────────────────────────────────
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Supabase JWT. Obtain by calling Supabase Auth signInWithPassword()
+        from the Admin Panel. Pass the `access_token` as the Bearer token.
+        The API validates this against SUPABASE_URL + SUPABASE_ANON_KEY.
+
+  # ─── Reusable Schemas ─────────────────────────────────────────────
+  schemas:
+
+    # ── Enums ────────────────────────────────────────────────────────
+    BookingStatus:
+      type: string
+      enum:
+        - pending_confirmation
+        - confirmed
+        - completed
+        - cancelled
+        - no_show
+
+    BookingSource:
+      type: string
+      enum:
+        - whatsapp
+        - admin_manual
+
+    ServiceCategory:
+      type: string
+      enum:
+        - short_cycle
+        - medium_cycle
+        - long_cycle
+
+    UserRole:
+      type: string
+      enum:
+        - agency_admin
+        - salon_owner
+        - salon_staff
+
+    InviteStatus:
+      type: string
+      enum:
+        - pending
+        - accepted
+        - expired
+        - revoked
+
+    SubscriptionStatus:
+      type: string
+      enum:
+        - active
+        - suspended
+        - cancelled
+
+    RevisitCampaignStatus:
+      type: string
+      enum:
+        - none
+        - day30_sent
+        - day37_sent
+        - converted
+        - non_responder
+
+    MessageType:
+      type: string
+      enum:
+        - booking_confirm
+        - reminder_24h
+        - reminder_3h
+        - review_request
+        - revisit_day30
+        - revisit_day37
+        - service_offline
+
+    MessageStatus:
+      type: string
+      enum:
+        - queued
+        - sent
+        - delivered
+        - read
+        - failed
+
+    # ── Core Resources ───────────────────────────────────────────────
+    Salon:
+      type: object
+      required: [id, name, slug, whatsappNumber, subscriptionStatus, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: Jaya Premium Salon
+        slug:
+          type: string
+          example: jaya-premium-salon
+        whatsappNumber:
+          type: string
+          example: "+919876543210"
+        googleReviewUrl:
+          type: string
+          format: uri
+          nullable: true
+        subscriptionStatus:
+          $ref: '#/components/schemas/SubscriptionStatus'
+        serviceOfflineMessage:
+          type: string
+          nullable: true
+        lastSuspendedAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastReactivatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        campaignResumeAfter:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Workers ignore customers whose lastVisitDate falls before this
+            timestamp. Set to NOW() on every reactivation to prevent
+            retroactive campaign blasting after a long offline period.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    Service:
+      type: object
+      required: [id, salonId, name, price, durationMinutes, category, isActive, displayOrder]
+      properties:
+        id:
+          type: string
+          format: uuid
+        salonId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: HydraFacial
+        description:
+          type: string
+          nullable: true
+        price:
+          type: integer
+          description: In paise. 350000 = ₹3,500.
+          example: 350000
+        durationMinutes:
+          type: integer
+          example: 60
+        category:
+          $ref: '#/components/schemas/ServiceCategory'
+        isActive:
+          type: boolean
+        displayOrder:
+          type: integer
+
+    Slot:
+      type: object
+      required: [id, salonId, startTime, endTime, isBlocked]
+      properties:
+        id:
+          type: string
+          format: uuid
+        salonId:
+          type: string
+          format: uuid
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        isBlocked:
+          type: boolean
+        stylistId:
+          type: string
+          format: uuid
+          nullable: true
+        bookingId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Null when available. Set atomically on booking claim.
+
+    Customer:
+      type: object
+      required: [id, salonId, phoneNumber, name, whatsappOptIn, revisitCampaignStatus, nonResponderCount, isNumberInvalid, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        salonId:
+          type: string
+          format: uuid
+        phoneNumber:
+          type: string
+          example: "+919876543210"
+        name:
+          type: string
+        whatsappOptIn:
+          type: boolean
+          description: |
+            Explicit opt-in for marketing-category messages.
+            Default false. Set true only when customer replies YES
+            during the booking confirmation opt-in step. (Risk D4 fix)
+        lastVisitDate:
+          type: string
+          format: date
+          nullable: true
+          description: |
+            The date of the actual appointment (slotStart::date),
+            NOT when staff clicked "mark complete". (Risk D1 fix)
+        lastVisitServiceId:
+          type: string
+          format: uuid
+          nullable: true
+        revisitCampaignStatus:
+          $ref: '#/components/schemas/RevisitCampaignStatus'
+        nonResponderCount:
+          type: integer
+        isNumberInvalid:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    Booking:
+      type: object
+      required: [id, salonId, customerId, serviceId, status, source, slotStart, slotEnd, actualVisitDate, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        salonId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        serviceId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        source:
+          $ref: '#/components/schemas/BookingSource'
+        slotStart:
+          type: string
+          format: date-time
+        slotEnd:
+          type: string
+          format: date-time
+        actualVisitDate:
+          type: string
+          format: date
+          description: |
+            Set from slotStart::date at creation time. Used by campaign
+            workers, not completedAt. Never changes after creation. (Risk D1)
+        reminder24hSent:
+          type: boolean
+        reminder3hSent:
+          type: boolean
+        reviewRequestSent:
+          type: boolean
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        completedById:
+          type: string
+          format: uuid
+          nullable: true
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        # Expanded relations (included when ?include=customer,service)
+        customer:
+          $ref: '#/components/schemas/Customer'
+          description: Populated when include=customer is requested
+        service:
+          $ref: '#/components/schemas/Service'
+          description: Populated when include=service is requested
+
+    User:
+      type: object
+      required: [id, email, name, role, isActive, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        supabaseUserId:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        name:
+          type: string
+        role:
+          $ref: '#/components/schemas/UserRole'
+        isActive:
+          type: boolean
+        salonId:
+          type: string
+          format: uuid
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    UserInvite:
+      type: object
+      required: [id, email, role, status, expiresAt, salonId, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/UserRole'
+        status:
+          $ref: '#/components/schemas/InviteStatus'
+        expiresAt:
+          type: string
+          format: date-time
+        salonId:
+          type: string
+          format: uuid
+        acceptedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    MessageLog:
+      type: object
+      required: [id, customerId, salonId, messageType, templateCategory, status, idempotencyKey, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        salonId:
+          type: string
+          format: uuid
+        bookingId:
+          type: string
+          format: uuid
+          nullable: true
+        messageType:
+          $ref: '#/components/schemas/MessageType'
+        templateCategory:
+          type: string
+          enum: [utility, marketing]
+        status:
+          $ref: '#/components/schemas/MessageStatus'
+        idempotencyKey:
+          type: string
+        metaMessageId:
+          type: string
+          nullable: true
+        metaErrorCode:
+          type: string
+          nullable: true
+        sentAt:
+          type: string
+          format: date-time
+          nullable: true
+        deliveredAt:
+          type: string
+          format: date-time
+          nullable: true
+        readAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    # ── Response Wrappers ────────────────────────────────────────────
+    # All API responses are wrapped in { success, data } or { success, error }.
+    # The Admin Panel uses success: boolean to determine rendering branch.
+
+    SuccessResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        data:
+          description: The response payload (varies per endpoint)
+
+    ErrorResponse:
+      type: object
+      required: [success, error]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code from shared/constants ERROR_CODES
+              example: SLOT_ALREADY_CLAIMED
+            message:
+              type: string
+              description: Human-readable message (safe to display)
+            details:
+              description: Additional structured context (validation errors, etc.)
+
+    # ── Pagination ────────────────────────────────────────────────────
+    PaginatedMeta:
+      type: object
+      required: [total, page, pageSize, totalPages]
+      properties:
+        total:
+          type: integer
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalPages:
+          type: integer
+
+    # ── Campaign Report ───────────────────────────────────────────────
+    CampaignReportRow:
+      type: object
+      required: [period, day30Sent, day30Delivered, day30Read, day37Sent, day37Delivered, day37Read, converted]
+      properties:
+        period:
+          type: string
+          description: "Month label, e.g. 'June 2026'"
+        day30Sent:
+          type: integer
+        day30Delivered:
+          type: integer
+        day30Read:
+          type: integer
+        day37Sent:
+          type: integer
+        day37Delivered:
+          type: integer
+        day37Read:
+          type: integer
+        converted:
+          type: integer
+          description: Customers who booked after receiving a revisit message
+
+    # ── System Health ──────────────────────────────────────────────────
+    SystemHealthSummary:
+      type: object
+      properties:
+        salonId:
+          type: string
+          format: uuid
+        salonName:
+          type: string
+        subscriptionStatus:
+          $ref: '#/components/schemas/SubscriptionStatus'
+        queueDepth:
+          type: object
+          properties:
+            reminders:
+              type: integer
+            reviewRequests:
+              type: integer
+            revisitCampaign:
+              type: integer
+            outboundMessages:
+              type: integer
+        failedMessageCount24h:
+          type: integer
+        metaQualityRating:
+          type: string
+          enum: [GREEN, YELLOW, RED]
+          nullable: true
+
+  # ── Common Parameters ──────────────────────────────────────────────
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSizeParam:
+      name: pageSize
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    DateFromParam:
+      name: dateFrom
+      in: query
+      schema:
+        type: string
+        format: date
+      description: Filter from this date (inclusive), in salon local timezone.
+    DateToParam:
+      name: dateTo
+      in: query
+      schema:
+        type: string
+        format: date
+      description: Filter to this date (inclusive), in salon local timezone.
+
+  # ── Common Responses ───────────────────────────────────────────────
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: UNAUTHORIZED
+              message: Authentication required
+    Forbidden:
+      description: Valid JWT but insufficient role for this action
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: FORBIDDEN
+              message: Your role does not have access to this resource
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ValidationError:
+      description: Request body or parameters failed validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error:
+              code: VALIDATION_ERROR
+              message: Request validation failed
+              details:
+                - field: slotId
+                  message: Required
+
+# ─────────────────────────────────────────────
+# GLOBAL SECURITY
+# All routes require BearerAuth unless marked with security: []
+# ─────────────────────────────────────────────
+security:
+  - BearerAuth: []
+
+# ─────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────
+paths:
+
+  # ════════════════════════════════════════════
+  # WEBHOOK (public — no auth, signature-validated)
+  # ════════════════════════════════════════════
+
+  /webhook/whatsapp:
+    get:
+      summary: Meta webhook verification handshake
+      description: |
+        Meta calls this once during webhook setup to verify ownership.
+        Returns hub.challenge if hub.verify_token matches META_WEBHOOK_VERIFY_TOKEN.
+        Risk E2: uses express.raw() — NOT express.json() — so the raw body
+        is available for HMAC-SHA256 signature validation on POST requests.
+      security: []
+      tags: [Webhook]
+      parameters:
+        - name: hub.mode
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: hub.verify_token
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: hub.challenge
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Challenge value echoed back to Meta
+          content:
+            text/plain:
+              schema:
+                type: string
+        '403':
+          description: Verify token mismatch
+
+    post:
+      summary: Receive inbound WhatsApp messages and status callbacks
+      description: |
+        All inbound customer messages and Meta delivery status callbacks
+        arrive here. The validateWebhookSignature middleware runs first
+        and rejects any request where X-Hub-Signature-256 does not match
+        HMAC-SHA256(rawBody, META_APP_SECRET). (Risk E2 fix)
+
+        Subscription gate: if salon.subscriptionStatus = suspended, the
+        message is intercepted here before reaching the state machine.
+        The offline message is sent (rate-limited per 24h per phone).
+        If status = cancelled, all messages are silently dropped.
+      security: []
+      tags: [Webhook]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Meta Cloud API webhook payload (varies by event type)
+      responses:
+        '200':
+          description: |
+            Always return 200 to Meta immediately, even if processing fails.
+            Meta retries on non-200 responses, which causes duplicate processing.
+            Internal errors are logged and alerted, not surfaced to Meta.
+
+  # ════════════════════════════════════════════
+  # AUTH
+  # ════════════════════════════════════════════
+
+  /auth/invite:
+    post:
+      summary: Create a staff invite (salon_owner and agency_admin only)
+      description: |
+        Creates a UserInvite row, hashes a random token, and sends an
+        invite email via Supabase Auth's invite mechanism.
+        salon_owner can only invite salon_staff.
+        agency_admin can invite any role.
+        Invite expires after 72 hours.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email:
+                  type: string
+                  format: email
+                role:
+                  $ref: '#/components/schemas/UserRole'
+      responses:
+        '201':
+          description: Invite created and email sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/UserInvite'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /auth/invite/accept:
+    post:
+      summary: Accept an invite and create account
+      description: |
+        Called when a new staff member clicks the invite link.
+        Validates the token (checks hash match, expiry, status = pending).
+        Creates the Supabase Auth user and our User row.
+        Sets invite status = accepted.
+        This is the ONLY path to account creation. No public signup exists.
+      security: []
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password, name]
+              properties:
+                token:
+                  type: string
+                  description: The raw token from the invite URL query param
+                password:
+                  type: string
+                  minLength: 8
+                name:
+                  type: string
+      responses:
+        '201':
+          description: Account created. User can now log in.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          description: Token not found or already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                success: false
+                error:
+                  code: INVITE_NOT_FOUND
+                  message: This invite link is invalid or has already been used
+
+  /auth/me:
+    get:
+      summary: Get current user profile and role
+      description: |
+        Used by the Admin Panel on load to determine which views to show
+        based on role. Also used to confirm the JWT is still valid.
+      tags: [Auth]
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ════════════════════════════════════════════
+  # SERVICES
+  # ════════════════════════════════════════════
+
+  /services:
+    get:
+      summary: List all active services for the salon
+      description: Returns services ordered by displayOrder. Inactive services excluded.
+      tags: [Services]
+      responses:
+        '200':
+          description: Service list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Service'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /services/{serviceId}:
+    parameters:
+      - name: serviceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    patch:
+      summary: Update a service (agency_admin only)
+      description: |
+        Partial update. Supply only the fields to change.
+        Setting isActive: false soft-deletes the service (no hard delete,
+        preserves FK integrity on historical bookings).
+      tags: [Services]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                price:
+                  type: integer
+                  description: In paise
+                durationMinutes:
+                  type: integer
+                category:
+                  $ref: '#/components/schemas/ServiceCategory'
+                isActive:
+                  type: boolean
+                displayOrder:
+                  type: integer
+      responses:
+        '200':
+          description: Updated service
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Service'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ════════════════════════════════════════════
+  # SLOTS
+  # ════════════════════════════════════════════
+
+  /slots:
+    get:
+      summary: List available slots for a given date and service
+      description: |
+        Returns open, unblocked slots that are long enough for the requested
+        service duration. Used by the Admin Panel's slot calendar view.
+        The WhatsApp state machine calls this internally — it is not called
+        directly by the customer.
+
+        Overlap check (Risk B1) is applied server-side: only slots with no
+        conflicting booking in the (start, start+duration+buffer) window
+        are returned.
+      tags: [Slots]
+      parameters:
+        - name: date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+          description: Date in YYYY-MM-DD, interpreted in salon timezone
+        - name: serviceId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Available slots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Slot'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /slots/{slotId}/block:
+    parameters:
+      - name: slotId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    patch:
+      summary: Block or unblock a slot (reception and above)
+      description: |
+        Used by reception to block specific times (staff breaks, holidays).
+        Cannot block a slot that already has a confirmed booking.
+      tags: [Slots]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [isBlocked]
+              properties:
+                isBlocked:
+                  type: boolean
+      responses:
+        '200':
+          description: Slot updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Slot'
+        '409':
+          description: Cannot block a slot with an active booking
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                success: false
+                error:
+                  code: BOOKING_NOT_CANCELLABLE
+                  message: This slot has a confirmed booking and cannot be blocked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ════════════════════════════════════════════
+  # BOOKINGS
+  # ════════════════════════════════════════════
+
+  /bookings:
+    get:
+      summary: List bookings with filters
+      description: |
+        Primary endpoint for the Admin Panel's bookings views.
+        Supports filtering by date range, status, and customer.
+        Results include expanded customer and service by default.
+      tags: [Bookings]
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - $ref: '#/components/parameters/DateFromParam'
+        - $ref: '#/components/parameters/DateToParam'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/BookingStatus'
+        - name: customerId
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: today
+          in: query
+          schema:
+            type: boolean
+          description: Shorthand for dateFrom=today&dateTo=today (salon timezone)
+      responses:
+        '200':
+          description: Paginated bookings list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Booking'
+                      meta:
+                        $ref: '#/components/schemas/PaginatedMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      summary: Create a booking manually (admin walk-in logging)
+      description: |
+        Used by reception staff to log walk-in visits or create bookings
+        on behalf of a customer who called in.
+        Source is set to admin_manual.
+
+        The same overlap check (Risk B1) applies as for WhatsApp bookings.
+        Walk-in creation resets the customer's revisit campaign state to
+        none and updates lastVisitDate. (Risk D2 fix)
+      tags: [Bookings]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customerPhone, customerName, serviceId, slotId]
+              properties:
+                customerPhone:
+                  type: string
+                  description: E.164 format. Upserts customer record.
+                  example: "+919876543210"
+                customerName:
+                  type: string
+                serviceId:
+                  type: string
+                  format: uuid
+                slotId:
+                  type: string
+                  format: uuid
+                notes:
+                  type: string
+                markCompleteImmediately:
+                  type: boolean
+                  default: false
+                  description: |
+                    Set true for walk-ins logged retrospectively.
+                    Immediately sets status=completed and updates
+                    lastVisitDate. Triggers review request job.
+      responses:
+        '201':
+          description: Booking created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Booking'
+        '409':
+          description: Slot already claimed or overlap detected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                slotClaimed:
+                  value:
+                    success: false
+                    error:
+                      code: SLOT_ALREADY_CLAIMED
+                      message: This slot was just taken. Please choose another.
+                overlapDetected:
+                  value:
+                    success: false
+                    error:
+                      code: SLOT_OVERLAP_DETECTED
+                      message: This time window conflicts with an existing booking.
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /bookings/{bookingId}:
+    parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      summary: Get a single booking with full details
+      tags: [Bookings]
+      responses:
+        '200':
+          description: Booking detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /bookings/{bookingId}/complete:
+    parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      summary: Mark a booking as complete (reception and above)
+      description: |
+        The primary admin panel action. Sets status = completed.
+        Records completedAt (admin action time) and completedById.
+        Updates customer.lastVisitDate to actualVisitDate (slotStart::date),
+        not to now(). (Risk D1 fix)
+        Updates customer.lastVisitServiceId.
+        Resets customer.revisitCampaignStatus to none.
+        Enqueues a review request job delayed by config.review.requestDelayHours.
+        Sets booking.reviewRequestSent = false (guard for the job).
+        This endpoint is idempotent — calling it twice is safe.
+      tags: [Bookings]
+      responses:
+        '200':
+          description: Booking marked complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Booking'
+        '409':
+          description: Booking is not in a completable state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                success: false
+                error:
+                  code: INVALID_BOOKING_STATUS_TRANSITION
+                  message: Only confirmed bookings can be marked complete
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /bookings/{bookingId}/cancel:
+    parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      summary: Cancel a booking
+      description: |
+        Sets status = cancelled. Frees the slot (bookingId → null).
+        Removes pending reminder jobs from BullMQ by deterministic jobId.
+        If removal fails, logs an alert — the pre-send re-check in the
+        worker catches any leaked jobs. (Risk C2 fix)
+        Records cancelledAt.
+      tags: [Bookings]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Optional cancellation reason for audit log
+      responses:
+        '200':
+          description: Booking cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Booking'
+        '409':
+          description: Booking cannot be cancelled in its current state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ════════════════════════════════════════════
+  # CUSTOMERS
+  # ════════════════════════════════════════════
+
+  /customers:
+    get:
+      summary: Search customers
+      tags: [Customers]
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Searches name and phoneNumber (partial match)
+        - name: campaignStatus
+          in: query
+          schema:
+            $ref: '#/components/schemas/RevisitCampaignStatus'
+      responses:
+        '200':
+          description: Customer list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Customer'
+                      meta:
+                        $ref: '#/components/schemas/PaginatedMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /customers/{customerId}/merge:
+    parameters:
+      - name: customerId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      summary: Merge a duplicate customer record (reception and above)
+      description: |
+        Used when a customer gets a new phone number and appears as a
+        new customer in the system. Merges sourceCustomerId into this
+        customer (the target), preserving booking history and visit dates.
+        The source record is soft-deleted after merge. (See Section 8.3)
+      tags: [Customers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceCustomerId]
+              properties:
+                sourceCustomerId:
+                  type: string
+                  format: uuid
+                  description: The duplicate record to merge INTO this customer
+      responses:
+        '200':
+          description: Merge complete
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ════════════════════════════════════════════
+  # ADMIN — REPORTS
+  # ════════════════════════════════════════════
+
+  /admin/reports/campaign:
+    get:
+      summary: Revisit campaign performance report (salon_owner and above)
+      description: |
+        Returns month-by-month funnel: sent → delivered → read → converted.
+        This is the report that substantiates the Clause 4.1 performance
+        milestone in the signed service agreement.
+      tags: [Admin - Reports]
+      parameters:
+        - name: months
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 12
+            default: 3
+          description: How many months of history to return
+      responses:
+        '200':
+          description: Campaign report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CampaignReportRow'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  # ════════════════════════════════════════════
+  # ADMIN — SYSTEM HEALTH (agency_admin only)
+  # ════════════════════════════════════════════
+
+  /admin/system/health:
+    get:
+      summary: Cross-client system health (agency_admin only)
+      description: |
+        Returns queue depths, error rates, and Meta quality ratings
+        across all salon clients. Never visible to salon_owner or
+        salon_staff — filtered by role in auth middleware.
+      tags: [Admin - System]
+      responses:
+        '200':
+          description: System health summary per salon
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SystemHealthSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/system/subscription:
+    patch:
+      summary: Update salon subscription status (agency_admin only)
+      description: |
+        The kill switch. Sets subscriptionStatus on the Salon record.
+
+        On transition to suspended:
+          - Sets lastSuspendedAt = NOW()
+          - All background workers pause for this salon
+          - Webhook begins serving the offline message (rate-limited)
+
+        On transition from suspended to active (reactivation):
+          - Sets lastReactivatedAt = NOW()
+          - Sets campaignResumeAfter = NOW()
+          - Workers resume. Campaign workers will skip any customers
+            whose lastVisitDate < campaignResumeAfter, preventing
+            retroactive blasting of months of backlog. (Biz Req 2)
+
+        On transition to cancelled:
+          - Sets lastSuspendedAt = NOW()
+          - All workers halted permanently for this salon
+          - No messages of any kind are sent
+      tags: [Admin - System]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subscriptionStatus]
+              properties:
+                subscriptionStatus:
+                  $ref: '#/components/schemas/SubscriptionStatus'
+      responses:
+        '200':
+          description: Subscription status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  data:
+                    $ref: '#/components/schemas/Salon'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+# ─────────────────────────────────────────────
+# TAGS (groups endpoints in generated docs/mocks)
+# ─────────────────────────────────────────────
+tags:
+  - name: Webhook
+    description: Meta Cloud API webhook handlers (public, signature-validated)
+  - name: Auth
+    description: Invite-only authentication flow
+  - name: Services
+    description: Salon service catalogue
+  - name: Slots
+    description: Appointment slot management
+  - name: Bookings
+    description: Booking lifecycle management
+  - name: Customers
+    description: Customer records and history
+  - name: Admin - Reports
+    description: Performance reports (salon_owner and above)
+  - name: Admin - System
+    description: System health and kill switch (agency_admin only)

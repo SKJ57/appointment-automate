@@ -1,0 +1,24 @@
+{
+  "name": "theslotbot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WhatsApp booking automation for luxury salons",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter './apps/*' dev",
+    "build": "pnpm --filter '@theslotbot/shared' build && pnpm --parallel --filter './apps/*' build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "db:migrate": "pnpm --filter @theslotbot/api db:migrate",
+    "db:seed": "pnpm --filter @theslotbot/api db:seed",
+    "db:studio": "pnpm --filter @theslotbot/api db:studio",
+    "generate-api-client": "bash scripts/generate-api-client.sh"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

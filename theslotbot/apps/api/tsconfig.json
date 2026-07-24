@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    // ─── Output ───────────────────────────────────────────────────────
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    // ─── Strict Mode (required per tech stack spec) ───────────────────
+    "strict": true,
+    "noUncheckedIndexedAccess": true,  // arr[0] is T | undefined, not T
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+
+    // ─── Interop ─────────────────────────────────────────────────────
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+
+    // ─── Path Aliases ────────────────────────────────────────────────
+    "baseUrl": ".",
+    "paths": {
+      "@theslotbot/shared/*": ["../../packages/shared/src/*"],
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*", "prisma/seeds/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
